@@ -1,0 +1,296 @@
+```yaml
+name: Build Whisper Offline APK
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+
+    - name: Create Project Structure
+      run: |
+        mkdir -p app/src/main/cpp
+        mkdir -p app/src/main/java/com/mohamedsaid/whisperoffline
+        mkdir -p app/src/main/res/values
+
+    - name: Write AndroidManifest
+      run: |
+        cat <<EOF > app/src/main/AndroidManifest.xml
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+            xmlns:tools="http://schemas.android.com/tools">
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+            <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+            
+            <application
+                android:label="WhisperOffline"
+                android:requestLegacyExternalStorage="true"
+                android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                <activity android:name=".MainActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+   
+    - name: Write Java Files
+      run: |
+        # NativeWhisper.java
+        cat <<EOF > app/src/main/java/com/mohamedsaid/whisperoffline/NativeWhisper.java
+        package com.mohamedsaid.whisperoffline;
+        public class NativeWhisper {
+            static { System.loadLibrary("whisperoffline"); }
+            public static native int transcribeChunked(String model, String audio, String out, String prog, int th, int sec, int rate);
+        EOF}
+
+        # MainActivity.java
+        cat <<EOF > app/src/main/java/com/mohamedsaid/whisperoffline/MainActivity.java
+        package com.mohamedsaid.whisperoffline;
+        import android.app.Activity;
+        import android.os.Bundle;
+        import android.widget.TextView;
+        import java.io.File;
+        public class MainActivity extends Activity {
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+                super.onCreate(savedInstanceState);
+                TextView tv = new TextView(this);
+                tv.setText("Whisper Offline Ready.\nCode Loaded Successfully.");
+                setContentView(tv);
+            }
+        }
+        EOF
+
+
+    - name: Write C++ Native Lib
+      run: |
+        cat << 'EOF' > app/src/main/cpp/native-lib.cpp
+        #include <jni.h>
+        #include <string>
+        #include <vector>
+        #include <thread>
+        #include <fstream>
+        #include <android/log.h>
+        #include <sys/stat.h>
+        #include <cstring>
+        #include <cmath>
+        #include "whisper.h"
+
+        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "WHISPER", __VA_ARGS__)
+        #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "WHISPER", __VA_ARGS__)
+
+        struct WavHeader { char riff[4]; uint32_t total_size; char wave[4]; };
+        struct ChunkHeader { char id[4]; uint32_t size; };
+
+        static bool read_wav_chunk_optimized(const char *path, int start_sample, int max_samples, std::vector<float> &out, int &total_file_samples) {
+            FILE *f = fopen(path, "rb");
+            if (!f) return false;
+            WavHeader header;
+            if (fread(&header, sizeof(WavHeader), 1, f) != 1) { fclose(f); return false; }
+            if (strncmp(header.riff, "RIFF", 4) != 0 || strncmp(header.wave, "WAVE", 4) != 0) { fclose(f); return false; }
+            
+            ChunkHeader chunk;
+            long data_offset = -1;
+            while (fread(&chunk, sizeof(ChunkHeader), 1, f) == 1) {
+                if (strncmp(chunk.id, "data", 4) == 0) {
+                    data_offset = ftell(f);
+                    total_file_samples = chunk.size / sizeof(int16_t);
+                    break;
+                }
+                fseek(f, chunk.size, SEEK_CUR);
+            }
+            if (data_offset == -1) { fclose(f); return false; }
+            if (start_sample >= total_file_samples) { fclose(f); return false; }
+
+            long seek_pos = data_offset + ((long)start_sample * sizeof(int16_t));
+            if (fseek(f, seek_pos, SEEK_SET) != 0) { fclose(f); return false; }
+
+            int samples_to_read = max_samples;
+            if (start_sample + samples_to_read > total_file_samples) samples_to_read = total_file_samples - start_sample;
+            if (samples_to_read <= 0) { fclose(f); return false; }
+
+            std::vector<int16_t> pcm16(samples_to_read);
+            size_t n_read = fread(pcm16.data(), sizeof(int16_t), samples_to_read, f);
+            fclose(f);
+            out.resize(n_read);
+            for (size_t i = 0; i < n_read; ++i) out[i] = pcm16[i] / 32768.0f;
+            return true;
+        }
+
+        static int load_progress(const char *progressPath) {
+            std::ifstream in(progressPath); if (!in.is_open()) return 0;
+            int v = 0; in >> v; return v;
+        }
+        static void save_progress(const char *progressPath, int v) {
+            std::ofstream out(progressPath, std::ios::trunc); out << v;
+        }
+
+        extern "C" JNIEXPORT jint JNICALL
+        Java_com_mohamedsaid_whisperoffline_NativeWhisper_transcribeChunked(JNIEnv *env, jclass, jstring jM, jstring jA, jstring jO, jstring jP, jint nThreads, jint sec, jint rate) {
+            const char *mPath = env->GetStringUTFChars(jM, nullptr);
+            const char *aPath = env->GetStringUTFChars(jA, nullptr);
+            const char *oPath = env->GetStringUTFChars(jO, nullptr);
+            const char *pPath = env->GetStringUTFChars(jP, nullptr);
+
+            whisper_context_params cparams = whisper_context_default_params();
+            struct whisper_context *ctx = whisper_init_from_file_with_params(mPath, cparams);
+            if (!ctx) { 
+                env->ReleaseStringUTFChars(jM, mPath); env->ReleaseStringUTFChars(jA, aPath);
+                env->ReleaseStringUTFChars(jO, oPath); env->ReleaseStringUTFChars(jP, pPath);
+                return -1; 
+            }
+
+            int chunk_samples = sec * rate;
+            int start_sample = load_progress(pPath);
+            int total_file_samples = 0;
+            std::ofstream out(oPath, std::ios::app);
+            std::string context_prompt = "";
+
+            while (true) {
+                std::vector<float> samples;
+                bool success = read_wav_chunk_optimized(aPath, start_sample, chunk_samples, samples, total_file_samples);
+                if (!success || samples.empty()) break;
+
+                whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+                params.print_progress = false; params.print_realtime = false; params.print_timestamps = false;
+                params.n_threads = nThreads > 0 ? nThreads : 4;
+                if (!context_prompt.empty()) params.initial_prompt = context_prompt.c_str();
+
+                if (whisper_full(ctx, params, samples.data(), samples.size()) != 0) break;
+
+                std::string chunk_text = "";
+                int n = whisper_full_n_segments(ctx);
+                for (int i = 0; i < n; ++i) {
+                    const char *t = whisper_full_get_segment_text(ctx, i);
+                    out << t; chunk_text += t;
+                }
+                out << " "; out.flush();
+                context_prompt = chunk_text;
+                start_sample += samples.size();
+                save_progress(pPath, start_sample);
+                if (start_sample >= total_file_samples) break;
+            }
+            out.close(); whisper_free(ctx);
+            env->ReleaseStringUTFChars(jM, mPath); env->ReleaseStringUTFChars(jA, aPath);
+            env->ReleaseStringUTFChars(jO, oPath); env->ReleaseStringUTFChars(jP, pPath);
+            return 0;
+        }
+        EOF
+
+    # ========================================================
+     whisper.cpp و ggml (Clone)
+    # ========================================================
+    - name: Download Whisper.cpp Source
+      run: |
+        cd app/src/main/cpp
+        git clone https://github.com/ggerganov/whisper.cpp.git
+        cd whisper.cpp
+      
+        git checkout v1.7.1 
+
+
+    - name: Write CMakeLists.txt
+      run: |
+        cat <<EOF > app/src/main/cpp/CMakeLists.txt
+        cmake_minimum_required(VERSION 3.22.1)
+        project("whisperoffline")
+
+        
+        set(WHISPER_DIR \${CMAKE_CURRENT_SOURCE_DIR}/whisper.cpp)
+        
+        include_directories(\${WHISPER_DIR})
+        include_directories(\${WHISPER_DIR}/include)
+        include_directories(\${WHISPER_DIR}/ggml/include)
+
+  
+            "\${WHISPER_DIR}/src/*.cpp"
+            "\${WHISPER_DIR}/src/*.c"
+            "\${WHISPER_DIR}/ggml/src/*.c"
+            "\${WHISPER_DIR}/ggml/src/*.cpp"
+        )
+        
+    
+        list(APPEND WHISPER_SOURCES "\${WHISPER_DIR}/src/whisper.cpp")
+
+        add_library(whisperoffline SHARED native-lib.cpp \${WHISPER_SOURCES})
+
+        find_library(log-lib log)
+        target_link_libraries(whisperoffline \${log-lib})
+        
+        if (ANDROID_ABI STREQUAL "arm64-v8a")
+            add_definitions(-O3 -DGGML_USE_CPU)
+        endif()
+        EOF
+
+    
+    - name: Write Build Gradle
+      run: |
+        # settings.gradle
+        echo 'include ":app"' > settings.gradle
+        
+        # build.gradle (Project)
+        cat <<EOF > build.gradle
+        buildscript {
+            repositories { google(); mavenCentral() }
+            dependencies { classpath "com.android.tools.build:gradle:8.2.0" }
+        }
+        allprojects { repositories { google(); mavenCentral() } }
+        EOF
+
+        # app/build.gradle
+        cat <<EOF > app/build.gradle
+        plugins { id "com.android.application" }
+        android {
+            namespace "com.mohamedsaid.whisperoffline"
+            compileSdk 34
+            defaultConfig {
+                applicationId "com.mohamedsaid.whisperoffline"
+                minSdk 26
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+                externalNativeBuild {
+                    cmake {
+                        cppFlags "-std=c++14"
+                        arguments "-DANDROID_STL=c++_shared"
+                    }
+                }
+                ndk { abiFilters "arm64-v8a", "armeabi-v7a" }
+            }
+            externalNativeBuild {
+                cmake { path "src/main/cpp/CMakeLists.txt" }
+            }
+        }
+        EOF
+
+    
+    - name: Build APK
+      run: gradle assembleDebug --no-daemon
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: whisper-offline-apk
+        path: app/build/outputs/apk/debug/app-debug.apk
+```
