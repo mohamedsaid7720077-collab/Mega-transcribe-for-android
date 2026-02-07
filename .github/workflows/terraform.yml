@@ -55,7 +55,7 @@ permissions:
 jobs:
   terraform:
     name: 'Terraform'
-    runs-  on: ubuntu-latest  permissions:
+    runs-  on: ubuntu-latest    cancel-timeout-minutes: 
       
     environment: production
 
